@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 
 from .domain import (
     ConflictError,
@@ -30,7 +30,7 @@ def _validate_result_release(actor, entity, data, lookup):
     method = _find_one(lookup, "method", "id", data.get("method_id"))
     if not instrument or instrument["status"] != "active":
         raise ValidationError("result requires an active instrument")
-    if not calibration_current(instrument["data"].get("due_at", ""), "2026-09-24"):
+    if not calibration_current(instrument["data"].get("due_at", ""), date.today().isoformat()):
         raise ValidationError("instrument calibration is not current")
     if not method or method["status"] != "validated":
         raise ValidationError("result requires a validated method")
@@ -39,18 +39,55 @@ def _validate_result_release(actor, entity, data, lookup):
     return {"released_by": actor.user_id}
 
 
-CUSTOM_CREATE = {'calibration': _validate_calibration}
-CUSTOM_TRANSITIONS = {('calibration', 'perform'): _validate_perform, ('result', 'release'): _validate_result_release}
+def _validate_instrument_calibrate(actor, entity, data, lookup):
+    if not data.get("passed"):
+        raise ValidationError("instrument can only return to service after a passed calibration")
+
+
+def _validate_check(actor, data, lookup):
+    instrument = _find_one(lookup, "instrument", "id", data.get("instrument_id"))
+    if not instrument:
+        raise ValidationError("instrument does not exist")
+    for field in ("standard_value", "measured_value", "allowed_deviation"):
+        try:
+            float(data.get(field))
+        except (TypeError, ValueError):
+            raise ValidationError(field + " must be numeric")
+    if float(data.get("allowed_deviation")) < 0:
+        raise ValidationError("allowed_deviation must be non-negative")
+
+
+def _validate_evaluate(actor, entity, data, lookup):
+    record = entity["data"]
+    deviation = abs(float(record.get("measured_value")) - float(record.get("standard_value")))
+    allowed = float(record.get("allowed_deviation"))
+    expired = not calibration_current(record.get("standard_due_at", ""), record.get("checked_at", ""))
+    reasons = []
+    if expired:
+        reasons.append("standard expired")
+    if deviation > allowed:
+        reasons.append("deviation exceeds limit")
+    return {
+        "next_status": "failed" if reasons else "passed",
+        "deviation": deviation,
+        "standard_expired": expired,
+        "failure_reasons": reasons,
+        "evaluated_by": actor.user_id,
+    }
+
+
+CUSTOM_CREATE = {'calibration': _validate_calibration, 'check': _validate_check}
+CUSTOM_TRANSITIONS = {('calibration', 'perform'): _validate_perform, ('result', 'release'): _validate_result_release, ('instrument', 'calibrate'): _validate_instrument_calibrate, ('check', 'evaluate'): _validate_evaluate}
 
 
 class RuleEngine:
-    ALIASES = {'instruments': 'instrument', 'calibrations': 'calibration', 'methods': 'method', 'results': 'result'}
-    INITIAL_STATUS = {'instrument': 'active', 'calibration': 'requested', 'method': 'draft', 'result': 'pending'}
-    TRANSITIONS = {'instrument': {'send_calibration': (('active',), 'calibrating'), 'calibrate': (('calibrating',), 'active'), 'quarantine': (('active',), 'quarantined'), 'restore': (('quarantined',), 'active')}, 'calibration': {'perform': (('requested', 'failed'), 'passed'), 'approve': (('passed',), 'approved'), 'reject': (('failed',), 'rejected')}, 'method': {'validate_method': (('draft',), 'validated'), 'revoke_method': (('validated',), 'revoked')}, 'result': {'release': (('pending',), 'released'), 'block': (('pending',), 'blocked'), 'reanalyze': (('blocked',), 'pending')}}
-    CREATE_REQUIRED = {'instrument': ('name', 'serial'), 'calibration': ('instrument_id', 'requested_at'), 'method': ('name', 'version'), 'result': ('sample_id', 'measurement')}
-    ACTION_REQUIRED = {('instrument', 'calibrate'): ('due_at', 'passed'), ('instrument', 'quarantine'): ('reason',), ('calibration', 'perform'): ('result', 'performed_at', 'uncertainty'), ('calibration', 'approve'): ('authorized_by',), ('calibration', 'reject'): ('reason',), ('method', 'validate_method'): ('parameters', 'instrument_ids'), ('method', 'revoke_method'): ('reason',), ('result', 'release'): ('instrument_id', 'method_id', 'value', 'unit'), ('result', 'block'): ('reason',), ('result', 'reanalyze'): ('reason',)}
-    CREATE_ROLES = {'instrument': ('admin', 'technician'), 'calibration': ('admin', 'metrology'), 'method': ('admin', 'authorizer'), 'result': ('admin', 'analyst')}
-    ROLE_ACTIONS = {'send_calibration': ('admin', 'technician'), 'calibrate': ('admin', 'metrology'), 'quarantine': ('admin', 'metrology'), 'restore': ('admin', 'metrology'), 'perform': ('admin', 'metrology'), 'approve': ('admin', 'authorizer'), 'reject': ('admin', 'authorizer'), 'validate_method': ('admin', 'authorizer'), 'revoke_method': ('admin', 'authorizer'), 'release': ('admin', 'analyst'), 'block': ('admin', 'analyst'), 'reanalyze': ('admin', 'analyst')}
+    ALIASES = {'instruments': 'instrument', 'calibrations': 'calibration', 'methods': 'method', 'results': 'result', 'checks': 'check'}
+    INITIAL_STATUS = {'instrument': 'active', 'calibration': 'requested', 'method': 'draft', 'result': 'pending', 'check': 'recorded'}
+    TRANSITIONS = {'instrument': {'send_calibration': (('active', 'out_of_service'), 'calibrating'), 'calibrate': (('calibrating',), 'active'), 'quarantine': (('active',), 'quarantined'), 'restore': (('quarantined',), 'active'), 'disable': (('active',), 'out_of_service')}, 'calibration': {'perform': (('requested', 'failed'), 'passed'), 'approve': (('passed',), 'approved'), 'reject': (('failed',), 'rejected')}, 'method': {'validate_method': (('draft',), 'validated'), 'revoke_method': (('validated',), 'revoked')}, 'result': {'release': (('pending',), 'released'), 'block': (('pending',), 'blocked'), 'reanalyze': (('blocked',), 'pending'), 'flag_review': (('released',), 'under_review'), 'rerelease': (('under_review',), 'released'), 'withdraw': (('under_review',), 'withdrawn')}, 'check': {'evaluate': (('recorded',), 'passed')}}
+    CREATE_REQUIRED = {'instrument': ('name', 'serial'), 'calibration': ('instrument_id', 'requested_at'), 'method': ('name', 'version'), 'result': ('sample_id', 'measurement'), 'check': ('instrument_id', 'standard_id', 'standard_value', 'measured_value', 'allowed_deviation', 'standard_due_at', 'checked_at')}
+    ACTION_REQUIRED = {('instrument', 'calibrate'): ('due_at', 'passed'), ('instrument', 'quarantine'): ('reason',), ('instrument', 'disable'): ('reason', 'check_id'), ('calibration', 'perform'): ('result', 'performed_at', 'uncertainty'), ('calibration', 'approve'): ('authorized_by',), ('calibration', 'reject'): ('reason',), ('method', 'validate_method'): ('parameters', 'instrument_ids'), ('method', 'revoke_method'): ('reason',), ('result', 'release'): ('instrument_id', 'method_id', 'value', 'unit'), ('result', 'block'): ('reason',), ('result', 'reanalyze'): ('reason',), ('result', 'flag_review'): ('reason', 'check_id'), ('result', 'rerelease'): ('review_note',), ('result', 'withdraw'): ('reason',)}
+    CREATE_ROLES = {'instrument': ('admin', 'technician'), 'calibration': ('admin', 'metrology'), 'method': ('admin', 'authorizer'), 'result': ('admin', 'analyst'), 'check': ('admin', 'metrology')}
+    ROLE_ACTIONS = {'send_calibration': ('admin', 'technician'), 'calibrate': ('admin', 'metrology'), 'quarantine': ('admin', 'metrology'), 'restore': ('admin', 'metrology'), 'disable': ('admin', 'metrology'), 'perform': ('admin', 'metrology'), 'approve': ('admin', 'authorizer'), 'reject': ('admin', 'authorizer'), 'validate_method': ('admin', 'authorizer'), 'revoke_method': ('admin', 'authorizer'), 'release': ('admin', 'analyst'), 'block': ('admin', 'analyst', 'metrology'), 'reanalyze': ('admin', 'analyst'), 'evaluate': ('admin', 'metrology'), 'flag_review': ('admin', 'metrology'), 'rerelease': ('admin', 'authorizer'), 'withdraw': ('admin', 'authorizer')}
 
     def normalize_kind(self, kind):
         return self.ALIASES.get(kind, kind)
@@ -101,9 +138,13 @@ class RuleEngine:
         self._require(data, self.ACTION_REQUIRED.get((kind, action), ()))
         custom = CUSTOM_TRANSITIONS.get((kind, action))
         extra = custom(actor, entity, data, lookup) if custom else {}
+        # A custom validator may override the default target status by
+        # returning a "next_status" key (e.g. check evaluation pass/fail).
+        if extra and "next_status" in extra:
+            next_status = extra["next_status"]
         patch = dict(data)
         if extra:
-            patch.update(extra)
+            patch.update({key: value for key, value in extra.items() if key != "next_status"})
         return next_status, patch
 
 

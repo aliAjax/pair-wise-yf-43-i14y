@@ -24,7 +24,15 @@ python3 app.py --db ./data.db --port 8309
 
 ## 核心对象
 
-- `instrument`：仪器状态；`calibration`：校准记录；`method`：方法版本；`result`：检测结果。
+- `instrument`：仪器状态；`calibration`：校准记录；`method`：方法版本；`result`：检测结果；`check`：期间核查。
+
+## 期间核查与结果追溯
+
+- 每次核查登记`instrument_id`、`standard_id`（标准器）、`standard_value`（标准值）、`measured_value`（实测值）、`allowed_deviation`（允许偏差）、`standard_due_at`（标准器有效期）和`checked_at`（核查日期）。
+- 对核查执行`evaluate`动作后，规则引擎计算偏差并核对标准器有效期：标准器过期或偏差超限则核查判为`failed`，否则为`passed`；偏差、是否过期和失败原因写回核查记录作为核查依据。
+- 核查失败时自动级联：仪器转入`out_of_service`（停用）；该仪器未放行的`pending`结果转入`blocked`并记录阻塞原因；自上次成功核查以来已放行的结果转入`under_review`（待复核），每条记录都携带触发核查的`check_id`。
+- 待复核结果由授权人处理：确认无影响用`rerelease`重新发布，有问题用`withdraw`撤回为`withdrawn`；原放行记录和核查依据保留在审计时间线。
+- 停用仪器可重新`send_calibration`，新校准合格（`calibrate`且`passed`为真）后恢复`active`。
 
 ## 主要接口
 

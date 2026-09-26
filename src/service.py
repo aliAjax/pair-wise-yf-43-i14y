@@ -56,7 +56,66 @@ class DomainService:
             updated["status"],
             {"patch": patch},
         )
+        self._after_transition(actor, updated, action)
         return updated
+
+    def _after_transition(self, actor, entity, action):
+        if entity["kind"] == "check" and action == "evaluate" and entity["status"] == "failed":
+            self._suspend_for_failed_check(actor, entity)
+
+    def _suspend_for_failed_check(self, actor, check):
+        instrument_id = check["data"].get("instrument_id")
+        if not instrument_id:
+            return
+        reasons = "; ".join(check["data"].get("failure_reasons", [])) or "unknown"
+        reason = "check %s failed: %s" % (check["id"], reasons)
+        instrument = self.repository.get_entity(instrument_id)
+        if instrument and instrument["status"] == "active":
+            self.transition(
+                actor, instrument_id, "disable",
+                {"reason": reason, "check_id": check["id"]},
+            )
+        for result in self.repository.find_entities("result", "instrument_id", instrument_id):
+            if result["status"] == "pending":
+                self.transition(
+                    actor, result["id"], "block",
+                    {"reason": reason, "check_id": check["id"]},
+                )
+        for result in self._released_since_last_passed_check(instrument_id):
+            self.transition(
+                actor, result["id"], "flag_review",
+                {"reason": reason, "check_id": check["id"]},
+            )
+
+    def _released_since_last_passed_check(self, instrument_id):
+        checks = self.repository.find_entities("check", "instrument_id", instrument_id)
+        passed_ids = {item["id"] for item in checks if item["status"] == "passed"}
+        entries = self.repository.list_audit()
+        since = 0
+        for entry in entries:
+            if (
+                entry["entity_id"] in passed_ids
+                and entry["action"] == "evaluate"
+                and entry["to_status"] == "passed"
+            ):
+                since = max(since, entry["id"])
+        flagged = []
+        for result in self.repository.find_entities("result", "instrument_id", instrument_id):
+            if result["status"] != "released":
+                continue
+            releases = [
+                entry["id"]
+                for entry in entries
+                if entry["entity_id"] == result["id"]
+                and entry["action"] in ("release", "rerelease")
+                and entry["to_status"] == "released"
+            ]
+            if since:
+                if releases and max(releases) > since:
+                    flagged.append(result)
+            else:
+                flagged.append(result)
+        return flagged
 
     def get(self, entity_id):
         entity = self.repository.get_entity(entity_id)
