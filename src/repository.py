@@ -104,6 +104,8 @@ class SQLiteRepository:
         return [self._entity_from_row(row) for row in rows]
 
     def find_entities(self, kind, field, value):
+        if field is None:
+            return self.list_entities(kind=kind)
         return [
             entity
             for entity in self.list_entities(kind=kind)
@@ -139,6 +141,76 @@ class SQLiteRepository:
         finally:
             connection.close()
         return self.get_entity(entity_id)
+
+    def apply_changes(self, changes):
+        """在单个事务里更新多个实体并追加审计记录。
+
+        每个 change: {"entity_id", "expected_version", "status", "data",
+                       "actor", "action", "from_status", "detail"}。
+        返回所有被更新实体的当前快照（按实体去重，保持变更顺序）。
+        """
+        now = utcnow()
+        ids = []
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            for change in changes:
+                row = connection.execute(
+                    "SELECT version FROM entities WHERE id = ?",
+                    (change["entity_id"],),
+                ).fetchone()
+                if not row:
+                    raise NotFoundError("entity not found: " + change["entity_id"])
+                current_version = int(row["version"])
+                expected = change.get("expected_version")
+                if expected is not None and current_version != int(expected):
+                    raise ConflictError(
+                        "version conflict: expected %s, found %s"
+                        % (expected, current_version)
+                    )
+                payload = json.dumps(
+                    change["data"], ensure_ascii=False, sort_keys=True
+                )
+                connection.execute(
+                    "UPDATE entities SET status = ?, version = version + 1, "
+                    "data = ?, updated_at = ? WHERE id = ? AND version = ?",
+                    (
+                        change["status"],
+                        payload,
+                        now,
+                        change["entity_id"],
+                        current_version,
+                    ),
+                )
+                actor = change["actor"]
+                connection.execute(
+                    "INSERT INTO audit_log(entity_id, actor_id, actor_role, "
+                    "action, from_status, to_status, detail, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        change["entity_id"],
+                        actor.user_id,
+                        actor.role,
+                        change["action"],
+                        change["from_status"],
+                        change["status"],
+                        json.dumps(
+                            change.get("detail") or {},
+                            ensure_ascii=False,
+                            sort_keys=True,
+                        ),
+                        now,
+                    ),
+                )
+                if change["entity_id"] not in ids:
+                    ids.append(change["entity_id"])
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+        return [self.get_entity(entity_id) for entity_id in ids]
 
     def append_audit(self, entity_id, actor_id, actor_role, action, from_status, to_status, detail):
         with self._connect() as connection:

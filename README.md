@@ -24,7 +24,39 @@ python3 app.py --db ./data.db --port 8309
 
 ## 核心对象
 
-- `instrument`：仪器状态；`calibration`：校准记录；`method`：方法版本；`result`：检测结果。
+- `instrument`：仪器状态（`active` / `calibrating` / `quarantined` / `stopped`）。
+- `calibration`：校准记录。
+- `method`：方法版本。
+- `result`：检测结果（`pending` / `released` / `blocked` / `review` / `withdrawn`）。
+- `standard`：核查用标准器，带有效期 `due_at`。
+- `check`：期间核查记录。
+
+## 期间核查与结果追溯
+
+年检合格不保证两次校准之间一直可靠，因此在两次校准之间用标准器做期间核查：
+
+1. `POST /api/standard` 登记标准器（`name`、`serial`、`due_at`）。
+2. `POST /api/check` 为仪器创建核查单（`instrument_id`、`standard_id`）。
+3. 对核查单执行 `perform`，必填 `standard_value`（标准值）、`measured_value`
+   （实测值）、`tolerance`（允许偏差）、`checked_at`。系统登记偏差
+   `|实测-标准|` 及标准器有效期。
+4. **标准器过期（`due_at < checked_at`）或偏差超限（`deviation > tolerance`）
+   时核查失败**，同一事务内级联处理：
+   - 仪器置 `stopped` 停用，`stop_reason` 记录具体原因；停用期间任何放行
+     （含复核后重新发布）都被拒绝，错误信息给出阻塞原因。
+   - 所有未放行（`pending`）结果置 `blocked`，`block_reason` 指向失败核查。
+   - 自上次成功核查（或无基线时的全部历史）以来已放行的结果置 `review`
+     待复核；更早的放行结果不受影响。
+5. 对 `review` 结果：
+   - 确认无影响：`republish`（需 `impact_assessment` 与 `no_impact=true`，
+     授权人角色），结果重新发布为 `released`，并以重新发布时间作为新的
+     追溯锚点；
+   - 确认有问题：`withdraw`（需 `reason`）撤回，终态 `withdrawn`。
+6. 仪器经 `send_calibration` + 新校准合格的 `calibrate` 后恢复 `active`；
+   被阻塞结果可 `reanalyze` 后重新放行。
+
+原始放行记录、阻塞/复核流转、核查依据（标准器、标准值、实测值、允许偏差、
+偏差、失败原因）都通过 `GET /api/audit` 保留在时间线中，不会被覆盖。
 
 ## 主要接口
 
